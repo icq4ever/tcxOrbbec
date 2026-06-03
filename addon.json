@@ -1,0 +1,26 @@
+{
+  "description": "Orbbec (Femto Bolt, Gemini, Astra) backend for tcxDepthCamera — depth, color, IR, point cloud",
+  "author": "tettou771",
+  "license": "MIT",
+  "category": "hardware",
+  "keywords": [
+    "orbbec",
+    "femto",
+    "gemini",
+    "astra",
+    "depth",
+    "depthcamera",
+    "pointcloud",
+    "tof",
+    "stereo",
+    "rgbd"
+  ],
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "dependencies": [
+    "tcxDepthCamera"
+  ]
+}
