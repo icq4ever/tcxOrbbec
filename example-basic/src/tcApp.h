@@ -27,4 +27,7 @@ private:
     Mesh cloud;
     bool colored = true;    // Orbbec has color; show it by default
     int step = 2;           // decimate a bit
+
+    float    fps_ = 0.0f;     // smoothed camera frame rate (from device timestamps)
+    uint64_t lastDevTs_ = 0;  // previous device timestamp (us)
 };
