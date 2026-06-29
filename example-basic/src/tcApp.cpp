@@ -19,21 +19,37 @@ void tcApp::setup() {
     view.setTarget(0.0f, 0.0f, 0.0f);
     view.setDistance(500.0f);
     view.enableMouseInput();
+    // Orthographic projection: a depth grid rendered as 1px points aliases into
+    // "interlaced" scanlines under perspective (row spacing varies with distance,
+    // beating against the pixel grid). Ortho keeps row spacing uniform, so the
+    // cloud reads smooth — this is what Orbbec-Sample-Viewer uses. Toggle with O.
+    view.enableOrtho();
 }
 
 void tcApp::update() {
     if (!deviceOk) return;
     camera->update();
-    if (camera->isFrameNew()) rebuild();
+    if (camera->isFrameNew()) {
+        // Camera frame rate from device-timestamp deltas (smoothed).
+        const uint64_t ts = camera->getDeviceTimestampUs();
+        if (lastDevTs_ != 0 && ts > lastDevTs_) {
+            const float inst = 1.0e6f / float(ts - lastDevTs_);
+            fps_ = (fps_ <= 0.0f) ? inst : fps_ * 0.9f + inst * 0.1f;
+        }
+        lastDevTs_ = ts;
+        rebuild();
+    }
 }
 
 // Rebuild the point-cloud mesh from the latest frame, in display units.
 void tcApp::rebuild() {
     cloud = camera->toMesh({.colors = colored, .step = step});
-    // tcxDepthCamera world coords are in meters with +Y down, with the camera
-    // (sensor) at the origin. Scale up for the viewer and flip Y up; leaving the
-    // origin where it is keeps the camera at (0,0,0) — the orbit pivot.
-    cloud.scale(100.0f, -100.0f, 100.0f);
+    // tcxDepthCamera world coords are camera/CV space (+X right, +Y down, +Z
+    // away). Convert to GL display: scale up and flip BOTH Y and Z. Flipping only
+    // Y leaves a left-handed, depth-mirrored cloud (looks ok head-on but stretched
+    // /wrong when you orbit). Negating Z too makes it right-handed; the camera
+    // (sensor) stays at the origin as the orbit pivot. Matches ofxOrbbec's (x,-y,-z).
+    cloud.scale(100.0f, -100.0f, -100.0f);
 }
 
 void tcApp::draw() {
@@ -92,17 +108,32 @@ void tcApp::draw() {
         hud  = camera->getDeviceName().empty() ? "Orbbec\n" : (camera->getDeviceName() + "\n");
         hud += to_string(cloud.getNumVertices()) + " points";
         hud += colored ? "  [colored]" : "  [plain]";
-        hud += "\nC: toggle color    1-4: decimation    drag: orbit";
+        hud += view.getOrtho() ? "  [ortho]" : "  [persp]";
+        hud += "\nC: color    O: ortho/persp    1-4: decimation    drag: orbit";
     } else {
         hud  = "No Orbbec device found.\n";
         hud += "Connect the camera, install the Orbbec SDK v2, and relaunch.";
     }
     drawBitmapString(hud, 20, 20);
+
+    // OrbbecViewer-style frame telemetry (top-right). Useful for spotting
+    // dropped/duplicated frames or an unstable rate.
+    if (deviceOk) {
+        const int f10 = (int)(fps_ * 10.0f + 0.5f);
+        string t  = "Frame index:        " + to_string(camera->getFrameIndex()) + "\n";
+        t        += "Device timestamp:   " + to_string(camera->getDeviceTimestampUs()) + " us\n";
+        t        += "Global timestamp:   " + to_string(camera->getGlobalTimestampUs()) + " us\n";
+        t        += "System timestamp:   " + to_string(camera->getSystemTimestampUs()) + " us\n";
+        t        += "Average frame rate: " + to_string(f10 / 10) + "." + to_string(f10 % 10) + " fps";
+        drawBitmapString(t, getWindowWidth() - 380.0f, 20.0f);
+    }
 }
 
 void tcApp::keyPressed(int key) {
     if (key == 'c' || key == 'C') {
         colored = !colored;
+    } else if (key == 'o' || key == 'O') {
+        view.setOrtho(!view.getOrtho());   // compare ortho vs perspective
     } else if (key >= '1' && key <= '4') {
         step = key - '0';
     }

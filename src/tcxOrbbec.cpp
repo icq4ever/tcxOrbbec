@@ -2,15 +2,13 @@
 // tcxOrbbec.cpp - Orbbec backend implementation (Orbbec SDK v2)
 // =============================================================================
 //
-// SCAFFOLD - NOT YET HARDWARE-VERIFIED. Written against the Orbbec SDK v2 C++
-// API (libobsensor / namespace ob) ahead of the hardware arriving. The exact
-// method names and color-format handling still need to be checked against the
-// installed SDK headers and a real Femto Bolt / Gemini 355L. See TODO.md.
+// Built on the Orbbec SDK v2 C++ API (libobsensor / namespace ob). Hardware-
+// verified on a Femto Bolt (depth 640x576 NFOV, color MJPG).
 //
 // Fills the canonical DepthFrame in captureInto(): depth (uint16 * valueScale),
 // native full-resolution color, IR, depth/color intrinsics + depth->color
-// extrinsic. World coordinates are left to the base's intrinsics deprojection
-// (an SDK point-cloud path is a follow-up).
+// extrinsic. World coordinates are left to the base's pinhole deprojection - the
+// SDK XY-table path was vertically broken on this device (see DEPROJECTION_NOTES.md).
 //
 // =============================================================================
 
@@ -19,6 +17,11 @@
 #include <libobsensor/ObSensor.hpp>
 
 #include <cstring>
+
+#if defined(__linux__) || defined(__APPLE__)
+    #include <dlfcn.h>
+    #include <filesystem>
+#endif
 
 using namespace std;
 
@@ -36,6 +39,9 @@ struct Orbbec::Impl {
     // Active stream profiles (kept for intrinsics / extrinsics).
     shared_ptr<ob::VideoStreamProfile> depthProfile;
     shared_ptr<ob::VideoStreamProfile> colorProfile;
+
+    // Converts encoded color (MJPG/YUYV/NV12/...) to RGB. Reused per frame.
+    ob::FormatConvertFilter colorConv;
 
     bool warnedColorFormat = false;
 };
@@ -63,6 +69,23 @@ static void copyDistortion(const OBCameraDistortion& d, DepthIntrinsics& out) {
 // -----------------------------------------------------------------------------
 bool Orbbec::openDevice() {
     try {
+        // Point the SDK at its extensions/ folder (depth engine, frame filters).
+        // The SDK's default is the cwd-relative "./extensions", so a system-wide
+        // install or a runtime lib bundled next to the binary is missed. The
+        // extensions/ folder always sits next to libOrbbecSDK, so derive the path
+        // from the actually-loaded shared library: this covers the Arch AUR
+        // (/usr/lib), the upstream .deb (/usr/local/lib) and the bundled-binary
+        // layouts alike, with no hard-coded path. Must run before the Context.
+#if defined(__linux__) || defined(__APPLE__)
+        Dl_info dlInfo{};
+        if (dladdr(reinterpret_cast<void*>(&ob_set_extensions_directory), &dlInfo)
+                && dlInfo.dli_fname) {
+            auto ext = std::filesystem::path(dlInfo.dli_fname).parent_path() / "extensions";
+            std::error_code ec;
+            if (std::filesystem::is_directory(ext, ec))
+                ob::Context::setExtensionsDirectory(ext.string().c_str());
+        }
+#endif
         impl_->context = make_shared<ob::Context>();
         auto devList = impl_->context->queryDeviceList();
         if (!devList || devList->getCount() == 0) {
@@ -82,6 +105,11 @@ bool Orbbec::openDevice() {
         if (deviceName_.find("Femto") != string::npos) sensorType_ = DepthSensorType::ToF;
         else if (deviceName_.find("Gemini") != string::npos) sensorType_ = DepthSensorType::Stereo;
         else if (deviceName_.find("Astra") != string::npos) sensorType_ = DepthSensorType::StructuredLight;
+
+        // Global (host-clock-aligned) timestamps are off by default; enable them
+        // for the telemetry readout. Not all devices support it — ignore failures.
+        try { impl_->device->enableGlobalTimestamp(true); }
+        catch (const ob::Error&) {}
 
         impl_->pipeline = make_shared<ob::Pipeline>(impl_->device);
         impl_->config   = make_shared<ob::Config>();
@@ -108,10 +136,15 @@ bool Orbbec::openDevice() {
 
         impl_->pipeline->start(impl_->config);
 
-        // Cache depth intrinsics + distortion.
+        // Cache depth intrinsics. We deliberately do NOT copy the depth distortion:
+        // the Femto Bolt depth sensor reports rational (Brown-Conrady-K6) coefficients
+        // (e.g. k1=17.9), whose large k1..k3 are balanced by a k4..k6 denominator. The
+        // tcxDepthCamera base implements only the 3-term Brown-Conrady and drops k4..k6,
+        // so feeding it these coefficients makes the radial term diverge and warps the
+        // cloud. Left at 0, the base deprojects as a plain pinhole, which is correct and
+        // isotropic for this sensor. See DEPROJECTION_NOTES.md.
         if (impl_->depthProfile) {
             copyIntrinsics(impl_->depthProfile->getIntrinsic(), depthIntrinsics_);
-            copyDistortion(impl_->depthProfile->getDistortion(), depthIntrinsics_);
         }
         // Cache color intrinsics + depth->color extrinsic.
         if (impl_->depthProfile && impl_->colorProfile) {
@@ -173,10 +206,21 @@ StreamFreshness Orbbec::captureInto(DepthFrame& dst) {
         dst.depthScale = depth->getValueScale() * 0.001f;
         dst.intrinsics = depthIntrinsics_;
         dst.timestamp  = depth->getTimeStampUs() * 1e-6;
-        dst.world.clear();   // base deprojects from intrinsics
+
+        // Telemetry (diagnostics / OrbbecViewer-style readout).
+        frameIndex_ = depth->getIndex();
+        deviceTsUs_ = depth->getTimeStampUs();
+        globalTsUs_ = depth->getGlobalTimeStampUs();   // 0 unless enabled
+        systemTsUs_ = depth->getSystemTimeStampUs();
 
         const uint16_t* db = reinterpret_cast<const uint16_t*>(depth->getData());
         dst.depth.assign(db, db + static_cast<size_t>(w) * h);
+
+        // Leave world[] empty so the base deprojects with the cached pinhole
+        // intrinsics - correct and isotropic for this sensor. An SDK XY-table path
+        // (getCalibrationParam + transformationDepthToPointCloud) was tried but
+        // produced a vertically-broken cloud here; see DEPROJECTION_NOTES.md.
+        dst.world.clear();
         fresh.depth = true;
     }
 
@@ -209,15 +253,42 @@ StreamFreshness Orbbec::captureInto(DepthFrame& dst) {
                 out[i*4+2] = cb[i*4+0]; out[i*4+3] = cb[i*4+3];
             }
         } else {
-            // MJPG / YUYV / etc. need an ob::FormatConvertFilter (TODO).
-            ok = false;
-            if (!impl_->warnedColorFormat) {
-                impl_->warnedColorFormat = true;
-                logWarning("tcxOrbbec")
-                    << "unsupported color format " << static_cast<int>(fmt)
-                    << "; add a FormatConvertFilter (see TODO). Color skipped.";
+            // Encoded formats (MJPG / YUYV / NV12 / Y8/Y16 / ...) -> RGB via the
+            // SDK's FormatConvertFilter, then packed to RGBA. Femto Bolt / Gemini
+            // color usually arrives as MJPG or YUYV, so this is the common path.
+            OBConvertFormat ct = FORMAT_MJPG_TO_RGB;
+            bool convertible = true;
+            switch (fmt) {
+                case OB_FORMAT_MJPG: ct = FORMAT_MJPG_TO_RGB; break;
+                case OB_FORMAT_YUYV: ct = FORMAT_YUYV_TO_RGB; break;
+                case OB_FORMAT_UYVY: ct = FORMAT_UYVY_TO_RGB; break;
+                case OB_FORMAT_NV12: ct = FORMAT_NV12_TO_RGB; break;
+                case OB_FORMAT_NV21: ct = FORMAT_NV21_TO_RGB; break;
+                case OB_FORMAT_Y16:  ct = FORMAT_Y16_TO_RGB;  break;
+                case OB_FORMAT_Y8:   ct = FORMAT_Y8_TO_RGB;   break;
+                default: convertible = false; break;
             }
-            dst.color = Pixels{};
+            shared_ptr<ob::VideoFrame> rgb;
+            if (convertible) {
+                impl_->colorConv.setFormatConvertType(ct);
+                if (auto o = impl_->colorConv.process(color)) rgb = o->as<ob::VideoFrame>();
+            }
+            if (rgb) {
+                const uint8_t* rb = reinterpret_cast<const uint8_t*>(rgb->getData());
+                for (size_t i = 0; i < n; ++i) {
+                    out[i*4+0] = rb[i*3+0]; out[i*4+1] = rb[i*3+1];
+                    out[i*4+2] = rb[i*3+2]; out[i*4+3] = 255;
+                }
+            } else {
+                ok = false;
+                if (!impl_->warnedColorFormat) {
+                    impl_->warnedColorFormat = true;
+                    logWarning("tcxOrbbec")
+                        << "unsupported color format " << static_cast<int>(fmt)
+                        << "; color skipped.";
+                }
+                dst.color = Pixels{};
+            }
         }
         if (ok) {
             if (haveColorCalib_) {
